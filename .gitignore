@@ -1,0 +1,12 @@
+sim/*.vcd
+sim/tb_pipeline
+sim/tb_soc
+*.swp
+*.bak
+EOFcd ~/rv32i-cache-core
+cat > .gitignore << 'EOF'
+sim/*.vcd
+sim/tb_pipeline
+sim/tb_soc
+*.swp
+*.bak
