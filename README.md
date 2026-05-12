@@ -1,299 +1,251 @@
 # rv32i-cache-core
 
-**RV32I Pipelined Processor with L1 Instruction and Data Caches**
-
-Simulation-verified. All tests passing. Targets PYNQ-Z1 (Zynq XC7Z020).
+A complete RV32I pipelined SoC implemented in Verilog, featuring a 5-stage in-order pipeline, Harvard L1 caches, and an AXI4-Lite UART peripheral. Built from scratch as a self-directed VLSI learning project.
 
 ---
 
-## Test Results
+## Architecture Overview
 
 ```
-Phase 1 — Pipeline registers:   18/18 PASS
-Phase 2/3 — Full SoC:           11/11 PASS
-
-x1 = 55  (sum 1..10 ✓)
-x4 = 0x400  (store address ✓)
-dcache[0x400] = 55  (write-back hit ✓)
-
-I$ hit rate: 94%   D$ hit rate: 5% (expected — small program, cold start)
+┌──────────────────────────────────────────────────────────────┐
+│                        rv32i_soc                             │
+│                                                              │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │              rv32i_pipeline_core                       │  │
+│  │        IF → ID → EX → MEM → WB  (RV32I ISA)          │  │
+│  │        Hazard detection + Operand forwarding           │  │
+│  └──────────────┬────────────────────┬────────────────────┘  │
+│                 │ imem               │ dmem                   │
+│          ┌──────┴──────┐      ┌──────┴──────┐                │
+│          │   icache    │      │   dcache    │                │
+│          └──────┬──────┘      └──────┬──────┘                │
+│                 │                    │    ┌────────────────┐  │
+│          ┌──────┴────────────────────┤    │   axi_uart     │  │
+│          │       sram_model          │◄───│  + uart_tx     │  │
+│          │  (dual-port, 2-cycle)     │    └────────────────┘  │
+│          └───────────────────────────┘   axi_interconnect     │
+└──────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## Project Structure
+## Memory Map
+
+| Address Range | Peripheral |
+|---|---|
+| `0x00000000 – 0x0FFFFFFF` | SRAM (instructions + data, via caches) |
+| `0x10000000 – 0x1FFFFFFF` | UART (AXI4-Lite, bypasses dcache) |
+
+**UART registers:**
+
+| Offset | Register | Description |
+|---|---|---|
+| `0x00` | TX_DATA | Write byte here to transmit |
+| `0x04` | STATUS | Bit 0 = `tx_ready` (1 = ready to send) |
+
+---
+
+## Pipeline Design
+
+5-stage in-order pipeline implementing the full RV32I base integer ISA.
+
+| Stage | Function |
+|---|---|
+| IF | Instruction fetch via icache |
+| ID | Decode + register file read |
+| EX | ALU + branch resolution + forwarding |
+| MEM | Data cache / AXI peripheral access |
+| WB | Write-back to register file |
+
+**Key design decisions:**
+
+- Branch resolves in EX (not MEM) — minimises flush penalty
+- Load-use hazard: `front_stall` freezes IF/ID/ID-EX only; `back_stall` (cache/peripheral) freezes all stages — this separation is critical for correct load-to-MEM advancement
+- Forwarding covers EX-EX and MEM-EX paths
+- Write-first register file prevents WB→ID RAW hazards
+
+---
+
+## AXI4-Lite UART Peripheral
+
+The CPU sends a character over UART using standard memory-mapped store/load instructions:
+
+```asm
+lui  x5, 0x10000       # x5 = 0x10000000 (UART base)
+addi x6, x0, 0x48      # x6 = 'H' (ASCII 72)
+poll:
+  lw   x7, 4(x5)       # read STATUS register
+  andi x7, x7, 1       # check tx_ready bit
+  beq  x7, x0, poll    # wait if not ready
+sw   x6, 0(x5)         # write 'H' to TX_DATA → transmits
+```
+
+**UART parameters:** 115200 baud, 100MHz clock, 1 start bit, 8 data bits, 1 stop bit, no parity.
+**AXI4-Lite interconnect** includes a DONE state after every transaction to prevent immediate re-triggering while the pipeline resumes.
+
+---
+
+## File Structure
 
 ```
-rv32i-cache-core/
-├── rtl/
-│   ├── core/
-│   │   ├── rv32i_pipeline_core.v   ← top-level pipeline (5-stage)
-│   │   ├── if_id_reg.v             ← IF/ID register (stall + flush)
-│   │   ├── id_ex_reg.v             ← ID/EX register (stall + flush)
-│   │   ├── ex_mem_reg.v            ← EX/MEM register (stall)
-│   │   ├── mem_wb_reg.v            ← MEM/WB register (stall)
-│   │   ├── hazard_unit.v           ← load-use stall + branch flush
-│   │   ├── forwarding_unit.v       ← EX-EX and MEM-EX bypass
-│   │   ├── alu.v                   ← all RV32I ALU operations
-│   │   ├── reg_file.v              ← 32×32 write-first register file
-│   │   ├── imm_gen.v               ← I/S/B/U/J immediate formats
-│   │   ├── control.v               ← opcode decoder
-│   │   └── branch_unit.v           ← BEQ/BNE/BLT/BGE/BLTU/BGEU
-│   ├── cache/
-│   │   ├── icache.v                ← direct-mapped I$ (read-only)
-│   │   └── dcache.v                ← direct-mapped D$ (write-back)
-│   ├── mem/
-│   │   └── sram_model.v            ← dual-port behavioral SRAM
-│   └── rv32i_soc.v                 ← SoC top: core + caches + SRAM
-├── tb/
-│   ├── tb_pipeline.v               ← Phase 1: unit tests (18 tests)
-│   └── tb_soc.v                    ← Phase 2/3: full SoC test
-└── sim/
-    ├── program.hex                  ← test program: sum 1..10 = 55
-    ├── tb_pipeline.vcd              ← generated waveform (Phase 1)
-    └── tb_soc.vcd                   ← generated waveform (Phase 2/3)
+rtl/
+├── core/
+│   ├── rv32i_pipeline_core.v   ← top-level pipeline
+│   ├── if_id_reg.v
+│   ├── id_ex_reg.v
+│   ├── ex_mem_reg.v
+│   ├── mem_wb_reg.v
+│   ├── hazard_unit.v
+│   ├── forwarding_unit.v
+│   ├── alu.v
+│   ├── reg_file.v
+│   ├── imm_gen.v
+│   ├── control.v
+│   └── branch_unit.v
+├── cache/
+│   ├── icache.v
+│   └── dcache.v
+├── mem/
+│   └── sram_model.v
+├── peripheral/
+│   ├── uart_tx.v
+│   ├── axi_uart.v
+│   └── axi_interconnect.v
+└── rv32i_soc.v                 ← top-level SoC
+
+tb/
+├── tb_pipeline.v               ← Phase 1 unit tests (18/18)
+└── tb_soc.v                    ← Full SoC tests (9/9)
+
+sim/
+└── program.hex                 ← Test program
 ```
+
+---
+
+## Test Program
+
+The simulation program (`sim/program.hex`) does the following:
+
+1. Computes the sum of integers 1 to 10 (result = 55)
+2. Stores the result at SRAM address `0x400`
+3. Loads the UART base address `0x10000000` into x5
+4. Polls the UART STATUS register until `tx_ready = 1`
+5. Transmits ASCII `'H'` (0x48) over the UART TX pin
+6. Halts (`jal x0, 0`)
+
+---
+
+## Simulation Results
+
+**Phase 1 — Pipeline unit tests: 18/18 PASS**
+
+**Phase 2 — Full SoC with UART: 9/9 PASS**
+
+```
+=== rv32i-cache-core + UART SoC Test ===
+
+--- Correctness ---
+  PASS  x1 = 55 (sum 1..10)
+  PASS  x4 = 0x400 (store addr)
+  PASS  x5 = 0x10000000 (UART base)
+  PASS  x6 = 0x48 (ASCII H)
+  PASS  x7 = 1 (STATUS ready)
+  PASS  UART received byte = H
+  PASS  UART transmission complete
+
+--- Cache Performance ---
+  PASS  I$ recorded hits
+  PASS  I$ recorded misses
+
+--- Performance Metrics ---
+  Total cycles  : 14999
+  I$ hits       : 14914
+  I$ misses     : 85
+  D$ hits       : 1
+  D$ misses     : 17
+  I$ hit rate   : 99%
+```
+
+---
+
+## Synthesis Results
+
+**Target:** Xilinx Zynq UltraScale+ (`xczu7eg-ffvc1156-2-e`, speed grade -2)
+**Tool:** Vivado 2024.2
+
+| Resource | Used | Available | Utilization |
+|---|---|---|---|
+| CLB LUTs | 8,047 | 230,400 | 3.49% |
+| Flip-Flops | 17,466 | 460,800 | 3.79% |
+| Block RAMs | 14.5 tiles | 312 | 4.65% |
+| DSPs | 0 | 1,728 | 0% |
+
+**Timing:**
+- Clock period: 10ns (100MHz constraint)
+- WNS: 2.450ns → **~170MHz capable**
+- TNS: 0.000ns
+- Failing endpoints: 0
+- **All timing constraints met ✓**
+
+The 14.5 BRAM tiles are inferred from the dual-port SRAM model (instruction + data memory). The register file is inferred as distributed RAM (LUT as Memory). No DSPs used — the ALU uses CARRY8 carry-chain logic.
 
 ---
 
 ## How to Run
 
-### Prerequisites
+**Prerequisites:** Icarus Verilog (`iverilog`), GTKWave (optional)
 
+**Phase 1 — Pipeline unit tests:**
 ```bash
-# Ubuntu / WSL
-sudo apt install iverilog gtkwave
-
-# macOS
-brew install icarus-verilog gtkwave
-```
-
-### Phase 1 — Pipeline unit tests
-
-```bash
-# Compile
-iverilog -o sim/tb_pipeline \
-  tb/tb_pipeline.v \
-  rtl/core/if_id_reg.v \
-  rtl/core/id_ex_reg.v \
-  rtl/core/ex_mem_reg.v \
-  rtl/core/mem_wb_reg.v \
-  rtl/core/hazard_unit.v \
-  rtl/core/forwarding_unit.v
-
-# Run
+iverilog -o sim/tb_pipeline tb/tb_pipeline.v rtl/core/*.v
 vvp sim/tb_pipeline
-
-# View waveforms
-gtkwave sim/tb_pipeline.vcd
 ```
 
-Expected output: `18/18 PASS`
-
-### Phase 2/3 — Full SoC simulation
-
+**Phase 2 — Full SoC simulation:**
 ```bash
-# Compile
-iverilog -o sim/tb_soc \
-  tb/tb_soc.v \
-  rtl/core/if_id_reg.v \
-  rtl/core/id_ex_reg.v \
-  rtl/core/ex_mem_reg.v \
-  rtl/core/mem_wb_reg.v \
-  rtl/core/hazard_unit.v \
-  rtl/core/forwarding_unit.v \
-  rtl/core/alu.v \
-  rtl/core/reg_file.v \
-  rtl/core/imm_gen.v \
-  rtl/core/control.v \
-  rtl/core/branch_unit.v \
-  rtl/core/rv32i_pipeline_core.v \
-  rtl/cache/icache.v \
-  rtl/cache/dcache.v \
-  rtl/mem/sram_model.v \
-  rtl/rv32i_soc.v
-
-# Run
+iverilog -o sim/tb_soc tb/tb_soc.v \
+  rtl/core/*.v rtl/cache/*.v rtl/mem/*.v \
+  rtl/peripheral/*.v rtl/rv32i_soc.v
 vvp sim/tb_soc
+```
 
-# View waveforms
+**View waveforms:**
+```bash
 gtkwave sim/tb_soc.vcd
 ```
 
-Expected output: `11/11 PASS`, I$ hit rate ~94%
+---
 
-### Vivado (alternative simulator)
+## Key Bugs Fixed During Development
 
-1. Create new RTL project — no board needed for simulation-only
-2. Add all `rtl/**/*.v` as **Design Sources**
-3. Add `tb/tb_soc.v` as **Simulation Source**
-4. Right-click `tb_soc` → **Run Simulation → Run Behavioral Simulation**
-5. Waveforms open automatically in Vivado's built-in viewer
+**1. Load-use stall freezing EX/MEM and MEM/WB (root cause of all UART failures)**
+The original `pipe_stall` signal was used for all pipeline registers. When a load-use hazard fired, it froze the entire pipeline including EX/MEM and MEM/WB, preventing the load instruction from advancing to the memory stage. Fixed by separating into `front_stall` (load-use + cache, for IF/ID/ID-EX) and `back_stall` (cache only, for EX/MEM/MEM-WB).
+
+**2. AXI interconnect immediate re-trigger**
+After an AXI transaction completed, `cpu_stall` dropped to 0 but `cpu_req` was still asserted for one cycle, causing a new transaction to start before the pipeline could advance. Fixed by adding a DONE state that holds for one cycle before returning to IDLE.
+
+**3. uart_access not gated by cpu_req**
+The LUI instruction loading `0x10000000` into x5 left that value in the MEM stage ALU result. Without gating `uart_access` by `cpu_dmem_req`, the interconnect fired spuriously for non-memory instructions. Fixed by: `uart_access = (addr[31:28] == 4'h1) && cpu_dmem_req`.
+
+**4. UART receiver off-by-one in testbench**
+The testbench receiver was sampling at the wrong clock count, missing the stop bit. Fixed by capturing the byte immediately when bit 7 is sampled rather than waiting for the stop bit window.
 
 ---
 
-## How to Evaluate Results
+## Tools Used
 
-There are three evaluation levels, used in this order:
-
-### Level 1 — GTKWave waveforms (simulation, primary method)
-
-Open `sim/tb_soc.vcd` in GTKWave after running the testbench.
-
-**Key signals to inspect:**
-
-| Signal path | What to look for |
+| Tool | Purpose |
 |---|---|
-| `dut.u_core.pc` | Advances by 4 each cycle; jumps to branch target on taken branch |
-| `dut.u_core.id__instr` | Instruction word flowing through decode |
-| `dut.u_core.ex__branch_taken` | Pulses high when branch/jump fires |
-| `dut.u_core.pipe_stall` | Goes high during cache misses |
-| `dut.u_icache.cpu_hit` | Toggles 0→1 as cache warms up |
-| `dut.u_icache.cpu_stall` | High during cache line fill |
-| `dut.u_dcache.dirty_array[0]` | Goes high after SW instruction |
-| `dut.u_core.wb__reg_write` | Pulses each time a register is written |
-| `dut.u_core.wb__write_data` | Should show 1,3,6,10,15,21,28,36,45,55 (partial sums) |
-
-**GTKWave tips:**
-- File → Open New Tab → select your `.vcd`
-- Drag signals from the Signal Browser into the wave panel
-- Press `Ctrl+Shift+F` to fit all in view
-- Click a signal → press `I` to zoom to a transition
-
-### Level 2 — Testbench pass/fail (automated)
-
-The testbench prints pass/fail for every check. This is the quickest sanity check — if all pass, waveform inspection is optional.
-
-### Level 3 — FPGA on PYNQ-Z1 (after simulation is clean)
-
-Once simulation passes:
-
-1. Open Vivado, create RTL project targeting `xc7z020clg400-1`
-2. Add all RTL sources, set `rv32i_soc` as top
-3. Add XDC constraints file with clock definition:
-   ```tcl
-   create_clock -period 10.000 [get_ports clk]
-   ```
-4. Run Synthesis → Implementation → Generate Bitstream
-5. Open Hardware Manager → Program Device
-6. Use ILA (Integrated Logic Analyzer) to probe internal signals at speed
+| Icarus Verilog | RTL simulation |
+| GTKWave | Waveform analysis |
+| Vivado 2024.2 | Synthesis, implementation, timing analysis |
+| Python | Instruction encoding verification |
 
 ---
 
-## How to Push to GitHub
+## Author
 
-### First time (new repo)
-
-```bash
-cd rv32i-cache-core
-
-# Initialize git
-git init
-git add .
-git commit -m "Initial commit: RV32I 5-stage pipeline + L1 cache SoC"
-
-# Create repo on GitHub (do this in browser or via gh CLI)
-gh repo create rv32i-cache-core --public --source=. --remote=origin --push
-
-# Or manually:
-git remote add origin https://github.com/YOUR_USERNAME/rv32i-cache-core.git
-git branch -M main
-git push -u origin main
-```
-
-### Subsequent pushes (after making changes)
-
-```bash
-# Check what changed
-git status
-git diff
-
-# Stage and commit
-git add rtl/core/alu.v          # add specific files
-git add .                        # or add everything
-
-git commit -m "Phase 2: add direct-mapped icache and dcache with write-back"
-
-# Push
-git push
-```
-
-### Recommended `.gitignore`
-
-```
-sim/*.vcd
-sim/tb_pipeline
-sim/tb_soc
-*.swp
-*.bak
-```
-
-Create it:
-```bash
-cat > .gitignore << 'EOF'
-sim/*.vcd
-sim/tb_pipeline
-sim/tb_soc
-*.swp
-*.bak
-EOF
-git add .gitignore
-git commit -m "Add .gitignore"
-```
-
-### Good commit message format
-
-```
-Phase 1: 5-stage pipeline with hazard + forwarding (18/18 tests pass)
-Phase 2: direct-mapped I$ and D$ with write-back policy
-fix: write-first register file prevents WB→ID RAW hazard
-fix: branch resolves in EX stage for correct cache-stall behavior
-```
-
----
-
-## Program: `sim/program.hex`
-
-Computes sum = 1 + 2 + ... + 10 = 55, stores result at address `0x400`.
-
-```asm
-addi x1, x0, 0       # sum = 0
-addi x2, x0, 1       # i = 1
-addi x3, x0, 11      # limit = 11
-loop:
-  add  x1, x1, x2   # sum += i
-  addi x2, x2, 1    # i++
-  blt  x2, x3, loop # while i < 11
-lui  x4, 0
-addi x4, x4, 0x400  # x4 = 0x400
-sw   x1, 0(x4)      # mem[0x400] = 55
-jal  x0, 0          # halt (infinite loop)
-```
-
-Expected register state after execution:
-- `x1 = 55`
-- `x2 = 11`
-- `x3 = 11`
-- `x4 = 0x400`
-
----
-
-## Architecture Notes
-
-### Key design decisions
-
-**Write-first register file** — standard in production cores. When WB writes to a register at the same cycle that ID reads it, the read returns the new value (bypasses the flip-flop). This prevents a RAW hazard that forwarding cannot catch.
-
-**Branch resolves in EX stage** — branch condition and target are both computed in EX. The PC redirect uses `ex__branch_taken` directly rather than waiting for EX/MEM. This is necessary for correct behavior under cache stalls: if the branch instruction is frozen in EX by an icache miss, the redirect fires correctly when the stall clears.
-
-**Global stall** — all five pipeline registers (IF/ID, ID/EX, EX/MEM, MEM/WB) freeze together on any cache miss. Register file writes are also gated. This prevents stale data from corrupting register state during multi-cycle fills.
-
-**Write-back D$** — stores update the cache line and set a dirty bit. The line is only written to SRAM on eviction. This is realistic (write-through would saturate memory bandwidth in a real system).
-
-### Known limitations (next steps)
-
-- No branch predictor (assumes not-taken, 2-cycle penalty on every taken branch)
-- No RV32I multiply/divide extension (M extension)
-- No CSR registers or privileged mode
-- D$ hit rate is low on cold start (expected — single small program)
-- No parameterized widths (hardcoded 32-bit)
+Bhuvanachandra Kusuma
+M.Sc. Nanoelectronic Systems, TU Dresden
+GitHub: [Bhuvanachandra-kusuma](https://github.com/Bhuvanachandra-kusuma)
